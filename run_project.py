@@ -1,12 +1,35 @@
 #!/usr/bin/env python3
-import argparse, coverage, importlib, inspect, multiprocessing, os, pickle, signal, subprocess, sys, time
+import argparse, ast, coverage, functools, importlib, inspect, multiprocessing, os, pickle, signal, subprocess, sys, time
 os.system('/usr/bin/Xorg -noreset +extension GLX +extension RANDR +extension RENDER -config /etc/X11/xorg.conf :1 &')
 
 TIMEOUT = 15
-def timeout_handler(signum, frame):
-    raise TimeoutError()
-signal.signal(signal.SIGALRM, timeout_handler)
-class JumpOutOfLoop(Exception): pass
+def label(name, num, prev, proc):
+    sys.settrace(None) # for efficiency
+    signal.signal(num, prev) # restore the original handler
+    proc.kill() # kill the alarm if the label is reached early
+def goto(label, signum, frame):
+    called_from = frame; lineno = label
+    if isinstance(lineno, str):
+        with open(called_from.f_code.co_filename) as f:
+            for node in ast.walk(ast.parse(f.read())):
+                if isinstance(node, ast.Call) \
+                    and isinstance(node.func, ast.Name) \
+                    and node.func.id == 'label' \
+                    and lineno == ast.literal_eval(node.args[0]):
+                    lineno = node.lineno
+    def hook(frame, event, arg):
+        if event == 'line' and frame == called_from:
+            frame.f_lineno = lineno
+            while frame:
+                frame.f_trace = None
+                frame = frame.f_back
+            return None
+        return hook
+    while frame:
+        frame.f_trace = hook
+        frame = frame.f_back
+    sys.settrace(hook)
+# class JumpOutOfLoop(Exception): pass
 
 parser = argparse.ArgumentParser(); parser.add_argument("mode"); parser.add_argument("project"); args = parser.parse_args()
 
@@ -35,7 +58,9 @@ def extract_function_list_from_modpath(modpath):
         now_dir = os.getcwd()
         os.chdir(os.path.abspath(os.path.dirname(os.path.join(rootdir, modpath.replace('.', '/') + '.py'))))
         sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.join(rootdir, modpath.replace('.', '/') + '.py'))))
-        signal.alarm(10); mod = importlib.import_module(modpath); signal.alarm(0); print(mod, end='')
+        prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '1'))
+        proc = subprocess.Popen(f"sleep 10 && kill -{num} {os.getpid()}", shell=True)
+        mod = importlib.import_module(modpath); print(mod, end='')
         for _, obj in inspect.getmembers(mod):
             if inspect.isclass(obj):
                 for _, o in inspect.getmembers(obj):
@@ -52,17 +77,14 @@ def extract_function_list_from_modpath(modpath):
                 ans[i] = a + '.' + b
             get_funcobj_from_modpath_and_funcname(modpath, ans[i]) # assert 的效果
             i += 1
-    except TimeoutError: pass
     except Exception as e:
-        signal.alarm(0)
         print('Exception: ' + str(e), end='', flush=True)
         print('\nWe\'re going to get stuck here...', flush=True)
         while True: pass
         if 'No module named' in str(e):
             print(' Raise Exception!!!', end='')
             raise e
-    print()
-    signal.alarm(0); os.chdir(now_dir)
+    label('1', num, prev, proc); os.chdir(now_dir)
     return ans
 
 # Decide whether to use given functions or not.
@@ -89,16 +111,15 @@ try:
                         funcs = extract_function_list_from_modpath(modpath)
                         for f in funcs:
                             if read_functions and (modpath, f) not in function_domain: continue
-                            try:
-                                signal.alarm(15*60)
-                                if args.mode == '1': cmd = f"./py-conbyte.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 20 --lib '{lib}' --include_exception --dump_projstats"
-                                elif args.mode == '2': cmd = f"./pyexz3.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 20 --lib '{lib}' --dump_projstats"
-                                else: cmd = f"./py-conbyte.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 1 --lib '{lib}' --include_exception --dump_projstats"
-                                print(modpath, '+', f, '>>>'); print(cmd)
-                                try: completed_process = subprocess.run(cmd, shell=True, stdout=sys.stdout, stderr=sys.stderr)
-                                except subprocess.CalledProcessError as e: print(e.output)
-                            except TimeoutError: pass
-                            signal.alarm(0)
+                            prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '2'))
+                            proc = subprocess.Popen(f"sleep {15*60} && kill -{num} {os.getpid()}", shell=True)
+                            if args.mode == '1': cmd = f"./py-conbyte.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 20 --lib '{lib}' --include_exception --dump_projstats"
+                            elif args.mode == '2': cmd = f"./pyexz3.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 20 --lib '{lib}' --dump_projstats"
+                            else: cmd = f"./py-conbyte.py -r '{rootdir}' '{modpath}' -s {f} {{}} -m 1 --lib '{lib}' --include_exception --dump_projstats"
+                            print(modpath, '+', f, '>>>'); print(cmd)
+                            try: completed_process = subprocess.run(cmd, shell=True, stdout=sys.stdout, stderr=sys.stderr)
+                            except subprocess.CalledProcessError as e: print(e.output)
+                            label('2', num, prev, proc)
                         os._exit(os.EX_OK)
                     os.wait(); pid = None
                 end = time.time()

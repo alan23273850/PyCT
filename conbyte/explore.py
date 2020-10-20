@@ -1,4 +1,4 @@
-import builtins, coverage, inspect, json, logging, multiprocessing, os, pickle, re, signal, sys, traceback
+import ast, builtins, coverage, functools, inspect, json, logging, multiprocessing, os, pickle, re, signal, subprocess, sys, traceback
 from conbyte.path import PathToConstraint
 from conbyte.solver import Solver
 from conbyte.utils import ConcolicObject, unwrap, get_funcobj_from_modpath_and_funcname
@@ -6,9 +6,33 @@ from conbyte.utils import ConcolicObject, unwrap, get_funcobj_from_modpath_and_f
 log = logging.getLogger("ct.explore")
 sys.setrecursionlimit(1000000) # The original limit is not enough in some special cases.
 
-def timeout_handler(signum, frame):
-    raise TimeoutError()
-signal.signal(signal.SIGALRM, timeout_handler)
+def label(name, num, prev, proc):
+    sys.settrace(None) # for efficiency
+    signal.signal(num, prev) # restore the original handler
+    proc.kill() # kill the alarm if the label is reached early
+
+def goto(label, signum, frame):
+    called_from = frame; lineno = label
+    if isinstance(lineno, str):
+        with open(called_from.f_code.co_filename) as f:
+            for node in ast.walk(ast.parse(f.read())):
+                if isinstance(node, ast.Call) \
+                    and isinstance(node.func, ast.Name) \
+                    and node.func.id == 'label' \
+                    and lineno == ast.literal_eval(node.args[0]):
+                    lineno = node.lineno
+    def hook(frame, event, arg):
+        if event == 'line' and frame == called_from:
+            frame.f_lineno = lineno
+            while frame:
+                frame.f_trace = None
+                frame = frame.f_back
+            return None
+        return hook
+    while frame:
+        frame.f_trace = hook
+        frame = frame.f_back
+    sys.settrace(hook)
 
 def prepare():
     #################################################################
@@ -79,23 +103,22 @@ class ExplorationEngine:
         if self.lib: sys.path.insert(0, os.path.abspath(self.lib))
         sys.path.insert(0, self.root); sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.join(self.root, self.modpath.replace('.', '/') + '.py'))))
         now_dir = os.getcwd(); os.chdir(os.path.abspath(os.path.dirname(os.path.join(self.root, self.modpath.replace('.', '/') + '.py'))))
-        try:
-            signal.alarm(15*60)
-            iterations = 1; cont = self._one_execution(all_args) # the 1st execution
-            while cont and iterations < max_iterations and len(self.constraints_to_solve) > 0:
-                ##############################################################
-                # In each iteration, we take one constraint out of the queue
-                # and try to solve for it. After that we'll obtain a model as
-                # a list of arguments and continue the next iteration with it.
-                constraint = self.constraints_to_solve.pop(0)
-                model = Solver.find_model_from_constraint(self, constraint)
-                ##############################################################
-                if model is not None:
-                    log.info(f"=== Iterations: {iterations} ==="); iterations += 1
-                    all_args.update(model) # from model to argument
-                    cont = self._one_execution(all_args) # other consecutive executions following the 1st execution
-        except TimeoutError: pass
-        signal.alarm(0); os.chdir(now_dir); del sys.path[0:2]
+        prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '1'))
+        proc = subprocess.Popen(f"sleep {15*60} && kill -{num} {os.getpid()}", shell=True)
+        iterations = 1; cont = self._one_execution(all_args) # the 1st execution
+        while cont and iterations < max_iterations and len(self.constraints_to_solve) > 0:
+            ##############################################################
+            # In each iteration, we take one constraint out of the queue
+            # and try to solve for it. After that we'll obtain a model as
+            # a list of arguments and continue the next iteration with it.
+            constraint = self.constraints_to_solve.pop(0)
+            model = Solver.find_model_from_constraint(self, constraint)
+            ##############################################################
+            if model is not None:
+                log.info(f"=== Iterations: {iterations} ==="); iterations += 1
+                all_args.update(model) # from model to argument
+                cont = self._one_execution(all_args) # other consecutive executions following the 1st execution
+        label('1', num, prev, proc); os.chdir(now_dir); del sys.path[0:2]
         if self.lib: del sys.path[0]
         if self.statsdir:
             with open(self.statsdir + '/inputs.pkl', 'wb') as f:
@@ -130,24 +153,24 @@ class ExplorationEngine:
             prepare(); self.path.__init__(); log.info("Inputs: " + str(all_args))
             import conbyte.wrapper; execute = get_funcobj_from_modpath_and_funcname(self.modpath, self.funcname)
             ccc_args, ccc_kwargs = self._get_concolic_arguments(execute, all_args) # primitive input arguments "all_args" may be modified here.
-            s1.send((all_args, self.var_to_types)); result = self.Exception
+            s1.send((all_args, self.var_to_types)); result = self.Timeout
+            prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '2'))
+            proc = subprocess.Popen(f"sleep {self.timeout} && kill -{num} {os.getpid()}", shell=True)
             try:
-                signal.alarm(self.timeout)
                 result = conbyte.utils.unwrap(execute(*ccc_args, **ccc_kwargs))
-                log.info(f"Return: {result}")
-            except TimeoutError:
-                result = self.Timeout
-                log.error(f"Timeout (soft) for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats")#; traceback.print_exc()
-                if self.statsdir:
-                    with open(self.statsdir + '/exception.txt', 'a') as f:
-                        print(f"Timeout (soft) for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats", file=f)
             except Exception as e:
+                result = self.Exception
                 log.error(f"Exception for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats")#; log.error(e); traceback.print_exc()
                 if self.statsdir:
                     with open(self.statsdir + '/exception.txt', 'a') as f:
                         print(f"Exception for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats", file=f); print(e, file=f)
+            label('2', num, prev, proc); log.info(f"Return: {result}")
+            if result is self.Timeout:
+                log.error(f"Timeout (soft) for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats")#; traceback.print_exc()
+                if self.statsdir:
+                    with open(self.statsdir + '/exception.txt', 'a') as f:
+                        print(f"Timeout (soft) for: {all_args} >> ./py-conbyte.py -r '{self.root}' '{self.modpath}' -s {self.funcname} {{}} -m 20 --lib '{self.lib}' --include_exception --dump_projstats", file=f)
             ###################################### Communication Section ######################################
-            signal.alarm(0)
             s0.send(0) # just a notification to the parent process that we're going to send data
             try: s2.send(result)
             except: s2.send(self.Unpicklable)
@@ -173,15 +196,12 @@ class ExplorationEngine:
         def child_process():
             sys.dont_write_bytecode = True # same reason mentioned in the concolic environment
             self.coverage.start(); execute = get_funcobj_from_modpath_and_funcname(self.modpath, self.funcname)
-            pri_args, pri_kwargs = self._complete_primitive_arguments(execute, all_args)
-            answer = self.Exception
-            try:
-                signal.alarm(self.timeout)
-                answer = execute(*pri_args, **pri_kwargs)
-            except TimeoutError: answer = self.Timeout
-            except: pass
-            signal.alarm(0)
-            self.coverage.stop(); self.coverage_data.update(self.coverage.get_data())
+            pri_args, pri_kwargs = self._complete_primitive_arguments(execute, all_args); answer = self.Timeout
+            prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '3'))
+            proc = subprocess.Popen(f"sleep {self.timeout} && kill -{num} {os.getpid()}", shell=True)
+            try: answer = execute(*pri_args, **pri_kwargs)
+            except: answer = self.Exception
+            label('3', num, prev, proc); self.coverage.stop(); self.coverage_data.update(self.coverage.get_data())
             for file in self.coverage_data.measured_files(): # "file" is absolute here.
                 _, _, missing_lines, _ = self.coverage.analysis(file)
                 if file not in self.coverage_accumulated_missing_lines:

@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
-import argparse, coverage, importlib, inspect, multiprocessing, os, pickle, signal, subprocess, sys, time
+import argparse, ast, coverage, functools, importlib, inspect, multiprocessing, os, pickle, signal, subprocess, sys, time
+os.system('/usr/bin/Xorg -noreset +extension GLX +extension RANDR +extension RENDER -config /etc/X11/xorg.conf :1 &')
 
 TIMEOUT = 15
-def timeout_handler(signum, frame):
-    raise TimeoutError()
-signal.signal(signal.SIGALRM, timeout_handler)
+def label(name, num, prev, proc):
+    sys.settrace(None) # for efficiency
+    signal.signal(num, prev) # restore the original handler
+    proc.kill() # kill the alarm if the label is reached early
+def goto(label, signum, frame):
+    called_from = frame; lineno = label
+    if isinstance(lineno, str):
+        with open(called_from.f_code.co_filename) as f:
+            for node in ast.walk(ast.parse(f.read())):
+                if isinstance(node, ast.Call) \
+                    and isinstance(node.func, ast.Name) \
+                    and node.func.id == 'label' \
+                    and lineno == ast.literal_eval(node.args[0]):
+                    lineno = node.lineno
+    def hook(frame, event, arg):
+        if event == 'line' and frame == called_from:
+            frame.f_lineno = lineno
+            while frame:
+                frame.f_trace = None
+                frame = frame.f_back
+            return None
+        return hook
+    while frame:
+        frame.f_trace = hook
+        frame = frame.f_back
+    sys.settrace(hook)
 
 parser = argparse.ArgumentParser(); parser.add_argument("mode"); parser.add_argument("project"); args = parser.parse_args()
 
@@ -40,12 +64,11 @@ for dirpath, _, files in os.walk(f"./project_statistics/{project_name}"):
                     cov.start(); execute = get_funcobj_from_modpath_and_funcname(dirpath.split('/')[-2], dirpath.split('/')[-1])
                     print('currently measuring >>>', dirpath.split('/')[-2], dirpath.split('/')[-1])
                     pri_args, pri_kwargs = _complete_primitive_arguments(execute, i)
-                    try:
-                        signal.alarm(TIMEOUT)
-                        execute(*pri_args, **pri_kwargs)
+                    prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '1'))
+                    proc = subprocess.Popen(f"sleep {TIMEOUT} && kill -{num} {os.getpid()}", shell=True)
+                    try: execute(*pri_args, **pri_kwargs)
                     except: pass
-                    signal.alarm(0)
-                    cov.stop(); coverage_data.update(cov.get_data())
+                    label('1', num, prev, proc); cov.stop(); coverage_data.update(cov.get_data())
                     for file in coverage_data.measured_files(): # "file" is absolute here.
                         _, _, missing_lines, _ = cov.analysis(file)
                         if file not in coverage_accumulated_missing_lines:
@@ -55,12 +78,11 @@ for dirpath, _, files in os.walk(f"./project_statistics/{project_name}"):
                     s0.send(0) # just a notification to the parent process that we're going to send data
                     s.send((coverage_data, coverage_accumulated_missing_lines))
                 process = multiprocessing.Process(target=child_process); process.start()
-                try:
-                    signal.alarm(TIMEOUT + 5)
-                    if r0.poll(TIMEOUT + 5): # may get stuck here for some unknown reason
-                        (coverage_data, coverage_accumulated_missing_lines) = r.recv()
-                except: pass
-                signal.alarm(0); r.close(); s.close(); r0.close(); s0.close()
+                prev = signal.signal(num := max(signal.valid_signals()), functools.partial(goto, '2'))
+                proc = subprocess.Popen(f"sleep {TIMEOUT + 5} && kill -{num} {os.getpid()}", shell=True)
+                if r0.poll(TIMEOUT + 5): # may get stuck here for some unknown reason
+                    (coverage_data, coverage_accumulated_missing_lines) = r.recv()
+                label('2', num, prev, proc); r.close(); s.close(); r0.close(); s0.close()
                 if process.is_alive(): process.kill()
                 if time.time() - start > 15 * 60: break
             # if time.time() - start2 > 3 * 60 * 60: break
